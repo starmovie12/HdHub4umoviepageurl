@@ -1,77 +1,85 @@
 from flask import Flask, request, jsonify
-import cloudscraper
-import re
-import time
+import requests
+from bs4 import BeautifulSoup
 import os
 
 app = Flask(__name__)
 
-# --- CONFIGURATION FOR RENDER ---
-def get_scraper():
-    # Render Server par 'Windows/Chrome' banna jyada safe hai
-    return cloudscraper.create_scraper(
-        browser={
-            'browser': 'chrome',
-            'platform': 'windows',
-            'desktop': True
-        }
-    )
+# --- CONFIGURATION ---
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+    "Referer": "https://hdhub4u.fo/"
+}
 
-def solve_hubcloud(url):
-    print(f"⚡ Processing Cloud Request: {url}")
-    scraper = get_scraper()
+# Junk Domains jo nahi chahiye
+JUNK_DOMAINS = ["catimages", "imdb.com", "googleusercontent", "instagram.com", "facebook.com", "wp-content"]
+
+def extract_clean_links(url):
+    print(f"⚡ Scanning: {url}")
     
     try:
-        # --- STEP 1: Main Page Visit ---
-        # Headers lagana jaruri hai taki asli user lage
-        headers_fake = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        }
+        response = requests.get(url, headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(response.text, 'html.parser')
         
-        resp1 = scraper.get(url, headers=headers_fake, timeout=15)
+        found_links = []
+        capture_mode = False 
         
-        # Check Cloudflare Block
-        if "Just a moment" in resp1.text:
-            return {"status": "error", "message": "Blocked by Cloudflare (Challenge Page)"}
+        # Content Area Dhundo
+        content_div = soup.find('div', class_='entry-content')
+        if not content_div: content_div = soup.find('main')
+        if not content_div: content_div = soup.body
+        
+        if not content_div:
+            return {"status": "error", "message": "Content div not found"}
 
-        # Redirect Link Dhundo
-        redirect_match = re.search(r'href="([^"]+hubcloud\.php\?[^"]+)"', resp1.text)
-        if not redirect_match:
-            # Backup Pattern
-            redirect_match = re.search(r'id="download"[^>]+href="([^"]+)"', resp1.text)
+        # Element by Element Scan
+        for element in content_div.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'p', 'div', 'a']):
+            text = element.get_text().strip().upper()
             
-        if not redirect_match:
-            return {"status": "error", "message": "Redirect Link Not Found"}
+            # 1. START SIGNAL
+            if "DOWNLOAD" in text and "LINK" in text and ":" in text:
+                capture_mode = True
+                continue 
 
-        next_url = redirect_match.group(1).replace("&amp;", "&")
-        
-        # --- STEP 2: Final Page Visit ---
-        # Thoda wait karo (Render fast hota hai, HubCloud pakad leta hai)
-        time.sleep(2) 
-        
-        # Referer HEADER ke bina link nahi milega
-        headers_final = {
-            "Referer": url,
-            "User-Agent": headers_fake["User-Agent"]
-        }
-        
-        resp2 = scraper.get(next_url, headers=headers_final, timeout=15)
-        
-        # --- STEP 3: Link Extraction ---
-        content = resp2.text
-        links = []
-        
-        # Regex Patterns
-        links.extend(re.findall(r'(https?://[^"\s\'>]+token=[^"\s\'>]+)', content))
-        links.extend(re.findall(r'(https?://[^"\s\'>]+\.(?:mkv|mp4)[^"\s\'>]*)', content))
-        
-        # Duplicate hatao
-        final_links = list(set([l.strip('"').strip("'") for l in links]))
-        
-        if not final_links:
-            return {"status": "error", "message": "No links found inside page"}
-            
-        return {"status": "success", "total": len(final_links), "links": final_links}
+            # 2. STOP SIGNAL
+            if capture_mode:
+                if "WATCH" in text or "PLAYER" in text or "PLAY ONLINE" in text:
+                    break 
+
+                # 3. LINK EXTRACTION
+                links_in_element = []
+                if element.name == 'a' and element.get('href'):
+                    links_in_element.append(element)
+                else:
+                    links_in_element = element.find_all('a', href=True)
+
+                for a_tag in links_in_element:
+                    link = a_tag['href']
+                    quality = a_tag.get_text().strip()
+                    
+                    # JUNK FILTER
+                    if any(junk in link for junk in JUNK_DOMAINS): continue
+                    if "WATCH" in quality.upper(): continue
+
+                    # Add to list
+                    if link not in [x['link'] for x in found_links]:
+                        # Quality Name Fix
+                        if not quality or len(quality) < 2:
+                            parent = a_tag.find_parent()
+                            if parent:
+                                prev = parent.find_previous(['h3', 'h4', 'h5', 'strong'])
+                                if prev: quality = prev.get_text().strip()
+                        
+                        # Clean Name
+                        clean_name = quality.replace("⚡", "").strip()
+                        if not clean_name: clean_name = "Download Link"
+
+                        found_links.append({"name": clean_name, "link": link})
+
+        if not found_links:
+            return {"status": "error", "message": "No links found (Check markers)"}
+
+        return {"status": "success", "total": len(found_links), "links": found_links}
 
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -79,16 +87,14 @@ def solve_hubcloud(url):
 # --- ROUTES ---
 @app.route('/')
 def home():
-    return "✅ HubCloud Solver is LIVE on Render!"
+    return "✅ Movie Extractor API is Running!"
 
-@app.route('/solve', methods=['GET'])
+@app.route('/extract', methods=['GET'])
 def api_handler():
     url = request.args.get('url')
     if not url: return jsonify({"error": "URL missing"}), 400
-    return jsonify(solve_hubcloud(url))
+    return jsonify(extract_clean_links(url))
 
-# --- SERVER START ---
 if __name__ == '__main__':
-    # Render apna PORT khud deta hai (Environment Variable se)
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
